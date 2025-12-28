@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>whendy_chat</title>
+  <style>
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .app { display:flex; height:100vh; }
+    .sidebar { width:280px; border-right:1px solid #ddd; padding:12px; box-sizing:border-box; display:flex; flex-direction:column; gap:10px;}
+    .main { flex:1; display:flex; flex-direction:column; }
+    .channels button { width:100%; text-align:left; padding:10px; margin:4px 0; border:1px solid #ddd; background:#fff; cursor:pointer; border-radius:10px; }
+    .channels button.active { font-weight:800; }
+    .topbar { padding:10px 12px; border-bottom:1px solid #ddd; display:flex; gap:10px; align-items:center; }
+    .chat { flex:1; padding:12px; overflow:auto; }
+    .msg { margin:10px 0; padding:10px; border:1px solid #eee; border-radius:12px; }
+    .meta { font-size:12px; color:#666; display:flex; gap:8px; align-items:center; }
+    .content { margin-top:6px; white-space:pre-wrap; word-break:break-word; }
+    .inputbar { padding:10px; border-top:1px solid #ddd; display:flex; gap:8px; align-items:center;}
+    input, button { padding:10px; border-radius:10px; border:1px solid #ddd; }
+    input { flex:1; }
+    .row { display:flex; gap:8px; }
+    .row > * { flex:1; }
+    .card { border:1px solid #ddd; border-radius:14px; padding:10px; }
+    .small { font-size:12px; color:#666; }
+    .pill { font-size:12px; border:1px solid #ddd; padding:3px 8px; border-radius:999px; }
+    .btn { cursor:pointer; }
+    .btnDanger { border-color:#f2c3c3; }
+    .btnSubtle { background:#f8f8f8; }
+    .onlineList { flex:1; overflow:auto; }
+    .onlineItem { padding:6px 8px; border:1px solid #eee; border-radius:10px; margin:6px 0; }
+    .typing { padding:6px 12px; font-size:12px; color:#666; border-top:1px dashed #eee; }
+    .mention { background: #fff4cc; padding:0 4px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="sidebar">
+      <div class="card">
+        <div style="font-weight:900;">Account</div>
+        <div class="small" id="meLine">Not logged in</div>
+        <div style="height:8px;"></div>
+
+        <div class="row">
+          <input id="username" placeholder="username (a-zA-Z0-9_)" />
+          <input id="password" type="password" placeholder="password (>=8)" />
+        </div>
+        <div style="height:8px;"></div>
+        <div class="row">
+          <button id="signup" class="btn">Sign up</button>
+          <button id="login" class="btn btnSubtle">Login</button>
+        </div>
+        <div style="height:8px;"></div>
+        <button id="logout" class="btn btnDanger">Logout</button>
+      </div>
+
+      <div class="card">
+        <div style="font-weight:900; margin-bottom:8px;">Channels</div>
+        <div class="channels" id="channels"></div>
+      </div>
+
+      <div class="card onlineList">
+        <div style="font-weight:900; margin-bottom:8px;">Online</div>
+        <div id="online"></div>
+      </div>
+    </div>
+
+    <div class="main">
+      <div class="topbar">
+        <div style="font-weight:900;">#</div>
+        <div id="currentChannel">general</div>
+        <div class="pill" id="status">disconnected</div>
+        <div style="margin-left:auto;" class="small">whendy_chat</div>
+      </div>
+
+      <div class="chat" id="chat"></div>
+      <div class="typing" id="typingBar" style="display:none;"></div>
+
+      <div class="inputbar">
+        <input id="message" placeholder="메시지 입력 후 Enter ( @username 멘션 가능 )" />
+        <button id="send" class="btn">Send</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+let ws = null;
+let currentChannel = "general";
+let token = localStorage.getItem("token") || "";
+let me = JSON.parse(localStorage.getItem("me") || "null");
+
+const typingState = new Map();
+
+const $ = (id) => document.getElementById(id);
+
+function setStatus(s) { $("status").textContent = s; }
+
+function setMeLine() {
+  if (me?.username) {
+    $("meLine").textContent = `Logged in as ${me.username}`;
+  } else {
+    $("meLine").textContent = "Not logged in";
+  }
+}
+
+function escapeHtml(s) {
+  return (s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+
+function highlightMentions(text) {
+  const safe = escapeHtml(text);
+  return safe.replace(/@([a-zA-Z0-9_]{3,20})/g, `<span class="mention">@$1</span>`);
+}
+
+function formatTime(ms) {
+  try { return new Date(ms).toLocaleTimeString(); } catch { return ""; }
+}
+
+function renderOnline(list) {
+  const el = $("online");
+  el.innerHTML = "";
+  (list || []).sort().forEach(name => {
+    const div = document.createElement("div");
+    div.className = "onlineItem";
+    div.textContent = name;
+    el.appendChild(div);
+  });
+}
+
+function renderTypingBar() {
+  const names = Array.from(typingState.keys());
+  if (names.length === 0) {
+    $("typingBar").style.display = "none";
+    $("typingBar").textContent = "";
+    return;
+  }
+  $("typingBar").style.display = "block";
+  $("typingBar").textContent = `${names.join(", ")} typing...`;
+}
+
+function markTyping(username, on) {
+  if (!username) return;
+  if (on) {
+    if (typingState.has(username)) clearTimeout(typingState.get(username));
+    const t = setTimeout(() => {
+      typingState.delete(username);
+      renderTypingBar();
+    }, 2500);
+    typingState.set(username, t);
+  } else {
+    if (typingState.has(username)) {
+      clearTimeout(typingState.get(username));
+      typingState.delete(username);
+    }
+  }
+  renderTypingBar();
+}
+
+function upsertMessageDOM(m) {
+  if (!m.messageId) return false;
+  const existing = document.querySelector(`[data-mid="${m.messageId}"]`);
+  if (!existing) return false;
+
+  // content 갱신
+  const contentEl = existing.querySelector(".content");
+  if (contentEl && m.content != null) {
+    contentEl.innerHTML = highlightMentions(m.content);
+  }
+  return true;
+}
+
+function removeMessageDOM(messageId) {
+  const el = document.querySelector(`[data-mid="${messageId}"]`);
+  if (el) el.remove();
+}
+
+function appendMessage(m) {
+  if (m.type === "edit") {
+    upsertMessageDOM({messageId: m.messageId, content: m.content});
+    return;
+  }
+  if (m.type === "delete") {
+    removeMessageDOM(m.messageId);
+    return;
+  }
+  if (m.type === "presence") {
+    renderOnline(m.online || []);
+    return;
+  }
+  if (m.type === "typing") {
+    if (m.user && m.user !== me?.username) {
+      markTyping(m.user, m.content === "on");
+    }
+    return;
+  }
+  if (m.type === "error") {
+    alert(m.error || "error");
+    return;
+  }
+
+  const chat = $("chat");
+
+  if (m.type === "history") {
+    chat.innerHTML = "";
+    (m.history || []).forEach(row => {
+      appendMessage({
+        type: "chat",
+        channelId: row.channelId,
+        user: row.username,
+        userId: row.userId,
+        ownerId: row.userId,
+        content: row.content,
+        messageId: row.id,
+        timestamp: row.createdAt
+      });
+    });
+    chat.scrollTop = chat.scrollHeight;
+    return;
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "msg";
+  if (m.messageId) wrap.dataset.mid = String(m.messageId);
+
+  const t = formatTime(m.timestamp || Date.now());
+
+  if (m.type === "system") {
+    wrap.innerHTML = `<div class="meta">[${t}] <b>system</b></div>
+                      <div class="content">${escapeHtml(m.content || "")}</div>`;
+  } else {
+    const isMine = (me?.username && m.user === me.username);
+    wrap.innerHTML = `
+      <div class="meta">
+        <b>${escapeHtml(m.user || "")}</b>
+        <span class="small">[${t}]</span>
+        ${m.messageId ? `<span class="small">#${m.messageId}</span>` : ""}
+        <span style="margin-left:auto;"></span>
+        ${isMine ? `
+          <button class="btn btnSubtle" data-act="edit">Edit</button>
+          <button class="btn btnDanger" data-act="delete">Delete</button>
+        ` : ""}
+      </div>
+      <div class="content">${highlightMentions(m.content || "")}</div>
+    `;
+
+    if (isMine && m.messageId) {
+      wrap.querySelector('[data-act="edit"]').onclick = () => {
+        const cur = (wrap.querySelector(".content")?.textContent || "").trim();
+        const next = prompt("Edit message:", cur);
+        if (next == null) return;
+        sendWS({type:"edit", messageId: m.messageId, content: next});
+      };
+      wrap.querySelector('[data-act="delete"]').onclick = () => {
+        if (!confirm("Delete this message?")) return;
+        sendWS({type:"delete", messageId: m.messageId});
+      };
+    }
+  }
+
+  chat.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+async function loadChannels() {
+  const res = await fetch("/api/channels");
+  const list = await res.json();
+  const el = $("channels");
+  el.innerHTML = "";
+  list.forEach(ch => {
+    const btn = document.createElement("button");
+    btn.textContent = "# " + ch.name;
+    btn.onclick = () => switchChannel(ch.id);
+    btn.dataset.id = ch.id;
+    el.appendChild(btn);
+  });
+  markActiveChannel();
+}
+
+function markActiveChannel() {
+  document.querySelectorAll(".channels button").forEach(b => {
+    b.classList.toggle("active", b.dataset.id === currentChannel);
+  });
+}
+
+function connect() {
+  if (!token) {
+    setStatus("login required");
+    if (ws) ws.close();
+    return;
+  }
+  setStatus("connecting...");
+
+  if (ws) ws.close();
+  ws = new WebSocket(`ws://${location.host}/ws?channel=${encodeURIComponent(currentChannel)}&token=${encodeURIComponent(token)}`);
+
+  ws.onopen = () => setStatus("connected");
+  ws.onclose = () => setStatus("disconnected");
+  ws.onerror = () => setStatus("error");
+
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      appendMessage(msg);
+    } catch {}
+  };
+}
+
+function switchChannel(id) {
+  currentChannel = id;
+  $("currentChannel").textContent = id;
+  markActiveChannel();
+
+  for (const [k, v] of typingState.entries()) clearTimeout(v);
+  typingState.clear();
+  renderTypingBar();
+
+  connect();
+}
+
+function sendWS(obj) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify(obj));
+}
+
+function sendMessage() {
+  const content = $("message").value.trim();
+  if (!content) return;
+  sendWS({type:"chat", content});
+  $("message").value = "";
+  sendTyping(false);
+}
+
+let typingOn = false;
+let typingTimer = null;
+
+function sendTyping(on) {
+  if (!ws || ws.readyState !== 1) return;
+  if (typingOn === on) return;
+  typingOn = on;
+  sendWS({type:"typing", isTyping: on});
+}
+
+function onTypingInput() {
+  if (!ws || ws.readyState !== 1) return;
+
+  sendTyping(true);
+  if (typingTimer) clearTimeout(typingTimer);
+  typingTimer = setTimeout(() => {
+    sendTyping(false);
+  }, 1200);
+}
+
+async function signup() {
+  const username = $("username").value.trim();
+  const password = $("password").value;
+  const res = await fetch("/api/auth/signup", {
+    method:"POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({username, password})
+  });
+  const data = await res.json();
+  if (!res.ok) return alert(data.error || "signup failed");
+  token = data.token;
+  me = data.user;
+  localStorage.setItem("token", token);
+  localStorage.setItem("me", JSON.stringify(me));
+  setMeLine();
+  connect();
+}
+
+async function login() {
+  const username = $("username").value.trim();
+  const password = $("password").value;
+  const res = await fetch("/api/auth/login", {
+    method:"POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({username, password})
+  });
+  const data = await res.json();
+  if (!res.ok) return alert(data.error || "login failed");
+  token = data.token;
+  me = data.user;
+  localStorage.setItem("token", token);
+  localStorage.setItem("me", JSON.stringify(me));
+  setMeLine();
+  connect();
+}
+
+function logout() {
+  token = "";
+  me = null;
+  localStorage.removeItem("token");
+  localStorage.removeItem("me");
+  setMeLine();
+  if (ws) ws.close();
+  setStatus("login required");
+  $("chat").innerHTML = "";
+  renderOnline([]);
+}
+
+$("signup").onclick = signup;
+$("login").onclick = login;
+$("logout").onclick = logout;
+$("send").onclick = sendMessage;
+$("message").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") sendMessage();
+});
+$("message").addEventListener("input", onTypingInput);
+
+setMeLine();
+loadChannels().then(() => {
+  $("currentChannel").textContent = currentChannel;
+  if (me?.username) {
+    $("username").value = me.username;
+  }
+  connect();
+});
+</script>
+</body>
+</html>
